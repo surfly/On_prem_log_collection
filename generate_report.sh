@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 #!/bin/bash
 set -Eeuo pipefail
 
@@ -454,3 +455,6 @@ if [[ $confirm == [yY] ]]; then
         echo "nc command not found. Cannot export."
     fi
 fi
+=======
+
+>>>>>>> origin/main
