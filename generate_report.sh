@@ -88,10 +88,8 @@ LIMIT_NPROC_HARD=$(ulimit -Hu 2>/dev/null || echo "unknown")
 
 if [[ "$LIMIT_NOFILE_SOFT" != "unknown" && "$LIMIT_NOFILE_SOFT" -ge 65535 ]]; then
     LIMIT_COLOR="green"
-    LIMIT_STATUS="configured"
 else
     LIMIT_COLOR="red"
-    LIMIT_STATUS="low or unknown"
 fi
 
 # Unprivileged ports
@@ -120,14 +118,39 @@ fi
 
 LICENSE_JSON=$(curl -s localhost:8017/info/ 2>/dev/null | jq '.' 2>/dev/null || echo '{"error": "API unreachable or jq missing"}')
 
-SERVICES=$(
+# Detect service scope: prefer user units, fallback to system units
+SERVICE_SCOPE="none"
+SERVICES=""
+
+USER_SERVICES=$(
+    systemctl --user list-units --type=service --all --no-legend 2>/dev/null \
+    | awk '{print $1}' \
+    | grep '^ss-.*\.service$' \
+    | sort -u || true
+)
+
+SYSTEM_SERVICES=$(
     systemctl list-units --type=service --all --no-legend 2>/dev/null \
     | awk '{print $1}' \
     | grep '^ss-.*\.service$' \
     | sort -u || true
 )
 
-ALL_UNITS=$(systemctl list-dependencies ss-surfly.target --no-pager 2>/dev/null || echo "ss-surfly.target not found")
+if [[ -n "${USER_SERVICES:-}" ]]; then
+    SERVICE_SCOPE="user"
+    SERVICES="$USER_SERVICES"
+elif [[ -n "${SYSTEM_SERVICES:-}" ]]; then
+    SERVICE_SCOPE="system"
+    SERVICES="$SYSTEM_SERVICES"
+fi
+
+if [[ "$SERVICE_SCOPE" == "user" ]]; then
+    ALL_UNITS=$(systemctl --user list-dependencies ss-surfly.target --no-pager 2>/dev/null || echo "ss-surfly.target not found in user scope")
+elif [[ "$SERVICE_SCOPE" == "system" ]]; then
+    ALL_UNITS=$(systemctl list-dependencies ss-surfly.target --no-pager 2>/dev/null || echo "ss-surfly.target not found in system scope")
+else
+    ALL_UNITS="No ss-* services found in user or system scope"
+fi
 
 # sslcheck
 SSLCHECK_BIN=$(command -v sslcheck || true)
@@ -150,18 +173,6 @@ else
     SSLCHECK_OUTPUT="sslcheck command not found in PATH"
     SSLCHECK_VERBOSE_OUTPUT="sslcheck command not found in PATH"
 fi
-
-# Validation summary
-VALIDATION_SUMMARY=$(cat <<EOF
-SELinux disabled or permissive: $SELINUX_STAT
-Non-privileged user created: $USER_STATUS
-System limits configured and applied: $LIMIT_STATUS
-Unprivileged ports enabled: $UNPRIV_PORT_STATUS (net.ipv4.ip_unprivileged_port_start=$UNPRIV_PORT_START)
-Systemd user-linger enabled: $LINGER_STATUS
-XDG_RUNTIME_DIR variable: $XDG_RUNTIME_DIR_VALUE
-XDG_RUNTIME_DIR verification: $XDG_STATUS
-EOF
-)
 
 cat > "$REPORT_FILE" <<EOF
 <!DOCTYPE html>
@@ -301,11 +312,6 @@ cat > "$REPORT_FILE" <<EOF
     <p><strong>Generated:</strong> $(date)</p>
     <p><strong>Report path:</strong> $(realpath "$REPORT_FILE")</p>
 
-    <div class="box">
-        <h2>✅ Environment Validation Summary</h2>
-        <pre class="small-pre">$(printf '%s' "$VALIDATION_SUMMARY" | html_escape)</pre>
-    </div>
-
     <div class="stat-grid">
         <div class="box">
             <h2>🖥️ System Specs</h2>
@@ -364,6 +370,7 @@ cat > "$REPORT_FILE" <<EOF
 
     <div class="box">
         <h2>🏗️ Service Dependencies</h2>
+        <p><strong>Detected service scope:</strong> $(printf '%s' "$SERVICE_SCOPE" | html_escape)</p>
         <pre>$(printf '%s' "$ALL_UNITS" | html_escape)</pre>
     </div>
 
@@ -397,7 +404,12 @@ if [[ -n "${SERVICES:-}" ]]; then
     for SERVICE in $SERVICES; do
         SAFE_ID=$(echo "$SERVICE" | tr '.@-' '___')
         LOG_FILE="$TMP_DIR/$SAFE_ID.log"
-        journalctl -u "$SERVICE" --no-pager -o short-iso 2>&1 | html_escape > "$LOG_FILE"
+
+        if [[ "$SERVICE_SCOPE" == "user" ]]; then
+            journalctl --user-unit "$SERVICE" --no-pager -o short-iso 2>&1 | html_escape > "$LOG_FILE"
+        else
+            journalctl -u "$SERVICE" --no-pager -o short-iso 2>&1 | html_escape > "$LOG_FILE"
+        fi
 
         cat >> "$REPORT_FILE" <<EOF
             <div class="log-panel" id="panel_$SAFE_ID">
