@@ -1,122 +1,444 @@
 #!/bin/bash
+set -Eeuo pipefail
 
-# Configuration and Paths from Surfly Manual [cite: 1316, 1317]
+umask 077
+
 CONFIG_FILE="$HOME/surfly/config.env"
-REPORT_FILE="surfly_diagnostic_full.html"
+CERT_FILE="$HOME/surfly/certs/cobrowse.surflysupport.com"
+REPORT_FILE="$PWD/surfly_diagnostic_full.html"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-# 1. System Data Extraction [cite: 1307, 2011]
-OS_NAME=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
-PODMAN_VER=$(podman --version | awk '{print $3}')
-SYSTEMD_VER=$(systemctl --version | head -n1 | awk '{print $2}')
+html_escape() {
+    sed \
+        -e 's/\&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&#39;/g"
+}
 
-# Robust SELinux Extraction 
-# Logic updated to handle "disabled" status found on your RHEL/CentOS node
-SELINUX_RAW=$(/usr/sbin/sestatus | awk -F: '/SELinux status/ {print $2}' | xargs)
-if [[ "$SELINUX_RAW" == "disabled" ]]; then
+echo "Collecting system information..."
+
+TARGET_USER=$(whoami)
+TARGET_UID=$(id -u "$TARGET_USER" 2>/dev/null || echo "unknown")
+EXPECTED_XDG="/run/user/$TARGET_UID"
+
+OS_NAME=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "unknown")
+PODMAN_VER=$(podman --version 2>/dev/null | awk '{print $3}' || echo "not installed")
+SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -n1 | awk '{print $2}' || echo "unknown")
+REDIS_VER=$(redis-server --version 2>/dev/null | awk '{print $3}' | cut -d'=' -f2 || echo "not installed")
+UMASK_VALUE=$(umask)
+UMASK_SYMBOLIC=$(umask -S 2>/dev/null || echo "unknown")
+XDG_RUNTIME_DIR_VALUE="${XDG_RUNTIME_DIR:-not set}"
+
+# User validation
+if id "$TARGET_USER" >/dev/null 2>&1; then
+    if [[ "$TARGET_UID" != "unknown" && "$TARGET_UID" -ge 1000 ]]; then
+        USER_STATUS="valid non-privileged user (uid=$TARGET_UID)"
+        USER_COLOR="green"
+    else
+        USER_STATUS="not recommended (uid=$TARGET_UID)"
+        USER_COLOR="red"
+    fi
+else
+    USER_STATUS="user not found"
+    USER_COLOR="red"
+fi
+
+# Linger validation
+LINGER_STATUS=$(loginctl show-user "$TARGET_USER" 2>/dev/null | awk -F= '/^Linger=/ {print $2}' || echo "unknown")
+if [[ "$LINGER_STATUS" == "yes" ]]; then
+    LINGER_COLOR="green"
+else
+    LINGER_COLOR="red"
+fi
+
+# XDG validation
+if [[ "$XDG_RUNTIME_DIR_VALUE" == "$EXPECTED_XDG" ]]; then
+    XDG_COLOR="green"
+    XDG_STATUS="verified"
+elif [[ "$XDG_RUNTIME_DIR_VALUE" == "not set" ]]; then
+    XDG_COLOR="red"
+    XDG_STATUS="not set"
+else
+    XDG_COLOR="orange"
+    XDG_STATUS="set but different from expected"
+fi
+
+# SELinux validation
+SELINUX_RAW=$(/usr/sbin/sestatus 2>/dev/null | awk -F: '/SELinux status/ {print $2}' | xargs || true)
+if [[ "${SELINUX_RAW:-unknown}" == "disabled" ]]; then
     SELINUX_STAT="disabled"
     SELINUX_COLOR="green"
 else
-    SELINUX_STAT=$(/usr/sbin/sestatus | awk -F: '/Current mode/ {print $2}' | xargs)
-    [[ "$SELINUX_STAT" == "permissive" ]] && SELINUX_COLOR="green" || SELINUX_COLOR="red"
+    SELINUX_STAT=$(/usr/sbin/sestatus 2>/dev/null | awk -F: '/Current mode/ {print $2}' | xargs || echo "unknown")
+    if [[ "$SELINUX_STAT" == "permissive" || "$SELINUX_STAT" == "disabled" ]]; then
+        SELINUX_COLOR="green"
+    else
+        SELINUX_COLOR="red"
+    fi
 fi
 
-# 2. Config Extraction & Security Masking [cite: 1324]
-# Masking sensitive tokens as requested to protect your environment 
-if [ -f "$CONFIG_FILE" ]; then
-    ENV_DATA=$(grep -v '^#' "$CONFIG_FILE" | grep '=' | \
-    sed 's/SECRET_KEY=.*/SECRET_KEY=********/' | \
-    sed 's/CLIENT_SECRET=.*/CLIENT_SECRET=********/' | \
-    sed 's/DASHBOARD_AUTH_TOKEN=.*/DASHBOARD_AUTH_TOKEN=********/' | \
-    sed 's/COBRO_AUTH_TOKEN=.*/COBRO_AUTH_TOKEN=********/' | \
-    sed 's/COOKIEJAR_SECRET=.*/COOKIEJAR_SECRET=********/')
+# System limits
+LIMIT_NOFILE_SOFT=$(ulimit -Sn 2>/dev/null || echo "unknown")
+LIMIT_NOFILE_HARD=$(ulimit -Hn 2>/dev/null || echo "unknown")
+LIMIT_NPROC_SOFT=$(ulimit -Su 2>/dev/null || echo "unknown")
+LIMIT_NPROC_HARD=$(ulimit -Hu 2>/dev/null || echo "unknown")
+
+if [[ "$LIMIT_NOFILE_SOFT" != "unknown" && "$LIMIT_NOFILE_SOFT" -ge 65535 ]]; then
+    LIMIT_COLOR="green"
+    LIMIT_STATUS="configured"
+else
+    LIMIT_COLOR="red"
+    LIMIT_STATUS="low or unknown"
+fi
+
+# Unprivileged ports
+UNPRIV_PORT_START=$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo "unknown")
+if [[ "$UNPRIV_PORT_START" == "0" ]]; then
+    UNPRIV_PORT_COLOR="green"
+    UNPRIV_PORT_STATUS="enabled"
+else
+    UNPRIV_PORT_COLOR="red"
+    UNPRIV_PORT_STATUS="not enabled"
+fi
+
+# Config file
+if [[ -f "$CONFIG_FILE" ]]; then
+    ENV_DATA=$(
+        grep -v '^#' "$CONFIG_FILE" 2>/dev/null | grep '=' | \
+        sed 's/SECRET_KEY=.*/SECRET_KEY=********/' | \
+        sed 's/CLIENT_SECRET=.*/CLIENT_SECRET=********/' | \
+        sed 's/DASHBOARD_AUTH_TOKEN=.*/DASHBOARD_AUTH_TOKEN=********/' | \
+        sed 's/COBRO_AUTH_TOKEN=.*/COBRO_AUTH_TOKEN=********/' | \
+        sed 's/COOKIEJAR_SECRET=.*/COOKIEJAR_SECRET=********/' || true
+    )
 else
     ENV_DATA="config.env not found at $CONFIG_FILE"
 fi
 
-# Pulling full Info JSON from local API 
-LICENSE_JSON=$(curl -s localhost:8017/info/ | jq '.' || echo '{"error": "API unreachable"}')
+LICENSE_JSON=$(curl -s localhost:8017/info/ 2>/dev/null | jq '.' 2>/dev/null || echo '{"error": "API unreachable or jq missing"}')
 
-# 3. Service Discovery [cite: 795, 1449]
-SERVICES=$(systemctl --user list-units "ss-*" --no-legend | awk '{print $1}' | grep ".service")
-ALL_UNITS=$(systemctl --user list-dependencies ss-surfly.target --no-pager)
+SERVICES=$(
+    systemctl list-units --type=service --all --no-legend 2>/dev/null \
+    | awk '{print $1}' \
+    | grep '^ss-.*\.service$' \
+    | sort -u || true
+)
 
-# Generate HTML
-cat <<EOF > $REPORT_FILE
+ALL_UNITS=$(systemctl list-dependencies ss-surfly.target --no-pager 2>/dev/null || echo "ss-surfly.target not found")
+
+# sslcheck
+SSLCHECK_BIN=$(command -v sslcheck || true)
+SSLCHECK_STATUS=""
+SSLCHECK_OUTPUT=""
+SSLCHECK_VERBOSE_OUTPUT=""
+
+if [[ -n "$SSLCHECK_BIN" ]]; then
+    if [[ -f "$CERT_FILE" ]]; then
+        SSLCHECK_STATUS="sslcheck found: $SSLCHECK_BIN"
+        SSLCHECK_OUTPUT=$("$SSLCHECK_BIN" verify -c "$CERT_FILE" 2>&1 || true)
+        SSLCHECK_VERBOSE_OUTPUT=$("$SSLCHECK_BIN" verify -c "$CERT_FILE" -v 2>&1 || true)
+    else
+        SSLCHECK_STATUS="sslcheck found, but certificate file not found: $CERT_FILE"
+        SSLCHECK_OUTPUT="Certificate file not found: $CERT_FILE"
+        SSLCHECK_VERBOSE_OUTPUT="Certificate file not found: $CERT_FILE"
+    fi
+else
+    SSLCHECK_STATUS="sslcheck command not found in PATH"
+    SSLCHECK_OUTPUT="sslcheck command not found in PATH"
+    SSLCHECK_VERBOSE_OUTPUT="sslcheck command not found in PATH"
+fi
+
+# Validation summary
+VALIDATION_SUMMARY=$(cat <<EOF
+SELinux disabled or permissive: $SELINUX_STAT
+Non-privileged user created: $USER_STATUS
+System limits configured and applied: $LIMIT_STATUS
+Unprivileged ports enabled: $UNPRIV_PORT_STATUS (net.ipv4.ip_unprivileged_port_start=$UNPRIV_PORT_START)
+Systemd user-linger enabled: $LINGER_STATUS
+XDG_RUNTIME_DIR variable: $XDG_RUNTIME_DIR_VALUE
+XDG_RUNTIME_DIR verification: $XDG_STATUS
+EOF
+)
+
+cat > "$REPORT_FILE" <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>Surfly Full Diagnostic Report</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; margin: 20px; background: #f0f2f5; color: #1c1e21; }
-        .container { max-width: 1400px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }
-        .box { padding: 20px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; }
-        pre { background: #1c1e21; color: #76ff03; padding: 15px; border-radius: 6px; overflow-x: auto; font-family: monospace; font-size: 12px; }
-        .tabs { display: flex; flex-wrap: wrap; margin-top: 20px; }
-        .tabs label { order: 1; display: block; padding: 10px 15px; margin: 0 4px 4px 0; cursor: pointer; background: #e4e6eb; border-radius: 6px; font-weight: bold; }
-        .tabs .tab-content { order: 99; flex-grow: 1; width: 100%; display: none; padding: 20px; border: 1px solid #ddd; }
-        .tabs input[type="radio"] { display: none; }
-        .tabs input[type="radio"]:checked + label { background: #0064ff; color: white; }
-        .tabs input[type="radio"]:checked + label + .tab-content { display: block; }
+        body {
+            font-family: 'Segoe UI', Tahoma, sans-serif;
+            margin: 0;
+            background: #f0f2f5;
+            color: #1c1e21;
+        }
+        .container {
+            max-width: 1600px;
+            margin: 20px auto;
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .stat-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+        .box {
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background: #fafafa;
+            margin-bottom: 20px;
+        }
+        pre {
+            background: #1c1e21;
+            color: #76ff03;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 75vh;
+        }
+        .small-pre {
+            background: #f4f4f4;
+            color: #333;
+            border: 1px solid #ccc;
+            max-height: 300px;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .sidebar {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background: #fafafa;
+            padding: 12px;
+            height: fit-content;
+            position: sticky;
+            top: 20px;
+        }
+        .sidebar input {
+            width: 100%;
+            box-sizing: border-box;
+            margin-bottom: 10px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+        }
+        .service-btn {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 10px 12px;
+            margin: 6px 0;
+            border: 0;
+            border-radius: 6px;
+            cursor: pointer;
+            background: #e4e6eb;
+            font-weight: 600;
+        }
+        .service-btn:hover {
+            background: #d8dbe1;
+        }
+        .service-btn.active {
+            background: #0064ff;
+            color: white;
+        }
+        .log-panel {
+            display: none;
+        }
+        .log-panel.active {
+            display: block;
+        }
+        .hint {
+            font-size: 12px;
+            color: #666;
+        }
     </style>
+    <script>
+        function showService(id, btn) {
+            document.querySelectorAll('.log-panel').forEach(function(p) {
+                p.classList.remove('active');
+            });
+            document.querySelectorAll('.service-btn').forEach(function(b) {
+                b.classList.remove('active');
+            });
+            var panel = document.getElementById(id);
+            if (panel) panel.classList.add('active');
+            if (btn) btn.classList.add('active');
+        }
+
+        function filterServices() {
+            var q = document.getElementById('serviceSearch').value.toLowerCase();
+            document.querySelectorAll('.service-btn').forEach(function(btn) {
+                var txt = btn.getAttribute('data-service').toLowerCase();
+                btn.style.display = txt.indexOf(q) !== -1 ? 'block' : 'none';
+            });
+        }
+
+        window.onload = function() {
+            var firstBtn = document.querySelector('.service-btn');
+            if (firstBtn) firstBtn.click();
+        };
+    </script>
 </head>
 <body>
-    <div class="container">
-        <h1>🚀 Surfly Node Diagnostic Report</h1>
-        <p><strong>Generated:</strong> $(date)</p>
+<div class="container">
+    <h1>🚀 Surfly Node Diagnostic Report</h1>
+    <p><strong>Generated:</strong> $(date)</p>
+    <p><strong>Report path:</strong> $(realpath "$REPORT_FILE")</p>
 
-        <div class="stat-grid">
-            <div class="box">
-                <h2>🖥️ System Specs</h2>
-                <p><strong>OS:</strong> $OS_NAME</p>
-                <p><strong>Podman:</strong> $PODMAN_VER (Req: 5.4.0+)</p>
-                <p><strong>Systemd:</strong> $SYSTEMD_VER (Req: 252+)</p>
-                <p><strong>SELinux:</strong> <span style="color: $SELINUX_COLOR; font-weight: bold;">$SELINUX_STAT</span></p>
-            </div>
-            <div class="box">
-                <h2>📜 License & Metadata</h2>
-                <pre style="background:#f4f4f4; color:#333; border:1px solid #ccc; max-height: 250px;">$LICENSE_JSON</pre>
-            </div>
+    <div class="box">
+        <h2>✅ Environment Validation Summary</h2>
+        <pre class="small-pre">$(printf '%s' "$VALIDATION_SUMMARY" | html_escape)</pre>
+    </div>
+
+    <div class="stat-grid">
+        <div class="box">
+            <h2>🖥️ System Specs</h2>
+            <p><strong>OS:</strong> $(printf '%s' "$OS_NAME" | html_escape)</p>
+            <p><strong>Podman:</strong> $(printf '%s' "$PODMAN_VER" | html_escape) (Req: 5.4.0+)</p>
+            <p><strong>Systemd:</strong> $(printf '%s' "$SYSTEMD_VER" | html_escape) (Req: 252+)</p>
+            <p><strong>Redis:</strong> $(printf '%s' "$REDIS_VER" | html_escape)</p>
+
+            <p><strong>User ($TARGET_USER):</strong>
+            <span style="color: $USER_COLOR; font-weight: bold;">$(printf '%s' "$USER_STATUS" | html_escape)</span></p>
+
+            <p><strong>SELinux:</strong>
+            <span style="color: $SELINUX_COLOR; font-weight: bold;">$(printf '%s' "$SELINUX_STAT" | html_escape)</span></p>
+
+            <p><strong>Loginctl Linger ($TARGET_USER):</strong>
+            <span style="color: $LINGER_COLOR; font-weight: bold;">$(printf '%s' "$LINGER_STATUS" | html_escape)</span></p>
+            <p class="hint">Linger allows user services to keep running after logout.</p>
+
+            <p><strong>XDG_RUNTIME_DIR:</strong>
+            <span style="color: $XDG_COLOR; font-weight: bold;">$(printf '%s' "$XDG_RUNTIME_DIR_VALUE" | html_escape)</span></p>
+            <p class="hint">Expected: $(printf '%s' "$EXPECTED_XDG" | html_escape) | Status: $(printf '%s' "$XDG_STATUS" | html_escape)</p>
+
+            <p><strong>Unprivileged ports:</strong>
+            <span style="color: $UNPRIV_PORT_COLOR; font-weight: bold;">$(printf '%s' "$UNPRIV_PORT_STATUS" | html_escape)</span></p>
+            <p class="hint">net.ipv4.ip_unprivileged_port_start=$(printf '%s' "$UNPRIV_PORT_START" | html_escape)</p>
+
+            <p><strong>Open files limit:</strong>
+            <span style="color: $LIMIT_COLOR; font-weight: bold;">soft=$(printf '%s' "$LIMIT_NOFILE_SOFT" | html_escape), hard=$(printf '%s' "$LIMIT_NOFILE_HARD" | html_escape)</span></p>
+            <p class="hint">Processes: soft=$(printf '%s' "$LIMIT_NPROC_SOFT" | html_escape), hard=$(printf '%s' "$LIMIT_NPROC_HARD" | html_escape)</p>
+
+            <p><strong>Umask:</strong> $(printf '%s' "$UMASK_VALUE" | html_escape) ($(printf '%s' "$UMASK_SYMBOLIC" | html_escape))</p>
         </div>
 
-        <div class="box" style="margin-bottom:20px;">
-            <h2>🔑 Configuration (config.env)</h2>
-            <pre style="background:#f4f4f4; color:#333; border:1px solid #ccc;">$ENV_DATA</pre>
+        <div class="box">
+            <h2>📜 License & Metadata</h2>
+            <pre class="small-pre">$(printf '%s' "$LICENSE_JSON" | html_escape)</pre>
         </div>
+    </div>
 
+    <div class="box">
+        <h2>🔑 Configuration (config.env)</h2>
+        <pre class="small-pre">$(printf '%s' "$ENV_DATA" | html_escape)</pre>
+    </div>
+
+    <div class="box">
+        <h2>🔐 SSL Certificate Check</h2>
+        <p><strong>Certificate path:</strong> $(printf '%s' "$CERT_FILE" | html_escape)</p>
+        <p><strong>Status:</strong> $(printf '%s' "$SSLCHECK_STATUS" | html_escape)</p>
+
+        <h3>sslcheck verify</h3>
+        <pre class="small-pre">$(printf '%s' "$SSLCHECK_OUTPUT" | html_escape)</pre>
+
+        <h3>sslcheck verify -v</h3>
+        <pre>$(printf '%s' "$SSLCHECK_VERBOSE_OUTPUT" | html_escape)</pre>
+    </div>
+
+    <div class="box">
         <h2>🏗️ Service Dependencies</h2>
-        <pre>$ALL_UNITS</pre>
+        <pre>$(printf '%s' "$ALL_UNITS" | html_escape)</pre>
+    </div>
 
-        <h2>📋 Service Logs (journalctl -n 2000)</h2>
-        <div class="tabs">
+    <h2>📋 Service Logs</h2>
+    <div class="layout">
+        <div class="sidebar">
+            <input type="text" id="serviceSearch" onkeyup="filterServices()" placeholder="Filter services...">
 EOF
 
-# Loop for 2000-line logs per service 
-FIRST=true
-for SERVICE in $SERVICES; do
-    CHECKED=""
-    if [ "$FIRST" = true ]; then CHECKED="checked"; FIRST=false; fi
-    SAFE_ID=$(echo $SERVICE | tr '.' '_')
-    LOG_DATA=$(journalctl --user-unit "$SERVICE" -n 2000 --no-pager | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-    
-    cat <<EOF >> $REPORT_FILE
-        <input type="radio" name="tabs" id="tab_$SAFE_ID" $CHECKED>
-        <label for="tab_$SAFE_ID">${SERVICE#ss-}</label>
-        <div class="tab-content">
-            <h3>Recent 2000 lines for $SERVICE</h3>
-            <pre>$LOG_DATA</pre>
+if [[ -z "${SERVICES:-}" ]]; then
+cat >> "$REPORT_FILE" <<EOF
+            <div class="box">
+                No ss-* services found.
+            </div>
+EOF
+else
+    for SERVICE in $SERVICES; do
+        SAFE_ID=$(echo "$SERVICE" | tr '.@-' '___')
+        cat >> "$REPORT_FILE" <<EOF
+            <button class="service-btn" data-service="$SERVICE" onclick="showService('panel_$SAFE_ID', this)">$SERVICE</button>
+EOF
+    done
+fi
+
+cat >> "$REPORT_FILE" <<EOF
         </div>
+        <div>
 EOF
-done
 
-echo "</div></div></body></html>" >> $REPORT_FILE
+if [[ -n "${SERVICES:-}" ]]; then
+    for SERVICE in $SERVICES; do
+        SAFE_ID=$(echo "$SERVICE" | tr '.@-' '___')
+        LOG_FILE="$TMP_DIR/$SAFE_ID.log"
+        journalctl -u "$SERVICE" --no-pager -o short-iso 2>&1 | html_escape > "$LOG_FILE"
+
+        cat >> "$REPORT_FILE" <<EOF
+            <div class="log-panel" id="panel_$SAFE_ID">
+                <div class="box">
+                    <h3>$SERVICE</h3>
+                    <p>Full journalctl output for this service</p>
+                    <pre>
+EOF
+        cat "$LOG_FILE" >> "$REPORT_FILE"
+        cat >> "$REPORT_FILE" <<EOF
+                    </pre>
+                </div>
+            </div>
+EOF
+    done
+fi
+
+cat >> "$REPORT_FILE" <<EOF
+        </div>
+    </div>
+</div>
+</body>
+</html>
+EOF
+
+chmod 600 "$REPORT_FILE"
+
 echo "------------------------------------------------"
-echo "Local report generated: $REPORT_FILE"
+echo "Local report generated: $(realpath "$REPORT_FILE")"
+ls -l "$REPORT_FILE"
 
-# Export Option
-read -p "Would you like to export this report to a shareable link? (y/n): " confirm
+read -r -p "Would you like to export this report to a shareable link? (y/n): " confirm
 if [[ $confirm == [yY] ]]; then
-    URL=$(cat "$REPORT_FILE" | nc termbin.com 9999)
-    echo "Successfully exported! Link: $URL"
+    if command -v nc >/dev/null 2>&1; then
+        URL=$(cat "$REPORT_FILE" | nc termbin.com 9999 || true)
+        if [[ -n "${URL:-}" ]]; then
+            echo "Successfully exported! Link: $URL"
+        else
+            echo "Export failed."
+        fi
+    else
+        echo "nc command not found. Cannot export."
+    fi
 fi
