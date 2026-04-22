@@ -107,11 +107,11 @@ fi
 if [[ -f "$CONFIG_FILE" ]]; then
     ENV_DATA=$(
         grep -v '^#' "$CONFIG_FILE" 2>/dev/null | grep '=' | \
-        sed 's/SECRET_KEY=.*/SECRET_KEY=********/' | \
-        sed 's/CLIENT_SECRET=.*/CLIENT_SECRET=********/' | \
-        sed 's/DASHBOARD_AUTH_TOKEN=.*/DASHBOARD_AUTH_TOKEN=********/' | \
-        sed 's/COBRO_AUTH_TOKEN=.*/COBRO_AUTH_TOKEN=********/' | \
-        sed 's/COOKIEJAR_SECRET=.*/COOKIEJAR_SECRET=********/' || true
+        sed -E '
+            s/^([[:space:]]*(SECRET_KEY|CLIENT_SECRET|DASHBOARD_AUTH_TOKEN|COBRO_AUTH_TOKEN|COOKIEJAR_SECRET|PG_EXTERNAL_USER_PASS)[[:space:]]*=).*/\1********/I;
+            s/^([[:space:]]*.*(PASS|PASSWORD|PASSWD|TOKEN|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH|CREDENTIALS)[[:space:]]*=).*/\1********/I;
+            s/^([[:space:]]*(SMTP_USER|SMTP_USERNAME|SMTP_PASSWORD|MAIL_USER|MAIL_USERNAME|MAIL_PASSWORD|MAILGUN_API_KEY|SENDGRID_API_KEY|POSTMARK_API_TOKEN)[[:space:]]*=).*/\1********/I
+        ' || true
     )
 else
     ENV_DATA="config.env not found at $CONFIG_FILE"
